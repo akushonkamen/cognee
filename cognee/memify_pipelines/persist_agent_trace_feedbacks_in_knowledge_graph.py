@@ -24,6 +24,7 @@ async def persist_agent_trace_feedbacks_in_knowledge_graph_pipeline(
     raw_trace_content: bool = False,
     last_n_steps: Optional[int] = None,
     run_in_background: bool = False,
+    config: Optional[dict] = None,
 ):
     """
     Persist agent trace content into the knowledge graph via memify pipeline.
@@ -74,6 +75,7 @@ async def persist_agent_trace_feedbacks_in_knowledge_graph_pipeline(
             dataset_id=dataset_to_write[0].id,
             node_set_name=node_set_name,
             user=user,
+            config=config,
         ),
     ]
 

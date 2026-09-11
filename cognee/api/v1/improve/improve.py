@@ -34,6 +34,11 @@ class ImproveKwargs(TypedDict, total=False):
     vector_db_config: dict
     graph_db_config: dict
     feedback_alpha: float
+    # Cognify config applied to the session-bridging cognify calls (session
+    # Q&A and agent trace feedbacks), e.g.
+    # ``{"ontology_config": {"ontology_resolver": resolver}}`` so those builds
+    # run ontology-constrained like a normal cognify(config=...) would.
+    cognify_config: dict
 
 
 async def improve(
@@ -165,6 +170,7 @@ async def improve(
                 operation_context.set_session_id(session_ids[0])
 
             feedback_alpha = kwargs.pop("feedback_alpha", 0.1)
+            cognify_config = kwargs.pop("cognify_config", None)
 
             # Mutex: single-session improves serialize on the session's
             # lock so auto-improve + idle-watcher + SessionEnd don't
@@ -195,6 +201,7 @@ async def improve(
                         user=user,
                         feedback_alpha=feedback_alpha,
                         run_in_background=run_in_background,
+                        cognify_config=cognify_config,
                     )
                     stages_run.extend(["feedback_weights", "persist_sessions"])
 
@@ -207,6 +214,7 @@ async def improve(
                         session_ids=session_ids,
                         user=user,
                         run_in_background=run_in_background,
+                        cognify_config=cognify_config,
                     )
                     stages_run.append("persist_trace_steps")
 
@@ -341,6 +349,7 @@ async def _bridge_sessions(
     user,
     feedback_alpha: float,
     run_in_background: bool,
+    cognify_config: Optional[dict] = None,
 ):
     """Run feedback weights and session persistence pipelines.
 
@@ -352,7 +361,8 @@ async def _bridge_sessions(
     Stage 2 (persist Q&A): Cognifies the actual question/answer text from
     sessions into the permanent graph, tagged with
     ``node_set="user_sessions_from_cache"``. This persists the Q&A content
-    itself, not serialized graph edges.
+    itself, not serialized graph edges. ``cognify_config`` (e.g. an
+    ontology resolver) applies to that cognify.
     """
 
     # Stage 1: apply feedback weights from session retrieval traces
@@ -380,6 +390,7 @@ async def _bridge_sessions(
         session_ids=session_ids,
         dataset=dataset,
         run_in_background=run_in_background,
+        config=cognify_config,
     )
     logger.info("improve: session Q&A persisted from %d session(s)", len(session_ids))
 
@@ -516,6 +527,7 @@ async def _persist_session_traces(
     session_ids: List[str],
     user,
     run_in_background: bool,
+    cognify_config: Optional[dict] = None,
 ):
     """Cognify per-step agent trace feedbacks into the knowledge graph.
 
@@ -541,6 +553,7 @@ async def _persist_session_traces(
             raw_trace_content=False,
             last_n_steps=None,  # persist all stored steps on demand
             run_in_background=run_in_background,
+            config=cognify_config,
         )
         logger.info(
             "improve: agent trace steps persisted from %d session(s)",

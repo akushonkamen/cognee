@@ -20,6 +20,7 @@ async def cognify_session(
     data: Union[SessionPersistWindow, list[SessionPersistWindow]],
     dataset_id: Optional[UUID | str] = None,
     user: Optional[User] = None,
+    config: Optional[dict] = None,
 ) -> None:
     """
     Cognify session windows into the knowledge graph and advance their watermarks.
@@ -72,7 +73,7 @@ async def cognify_session(
             # window's watermark put (so it is re-extracted and retried on the
             # next improve()), and continue with the remaining windows.
             cognify_result = await cognee.cognify(
-                datasets=[dataset_id], user=user, raise_on_error=False
+                datasets=[dataset_id], user=user, raise_on_error=False, config=config
             )
             errored_run = get_errored_run_info(cognify_result)
             if errored_run is not None:

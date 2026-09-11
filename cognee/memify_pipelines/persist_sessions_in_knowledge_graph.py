@@ -19,6 +19,7 @@ async def persist_sessions_in_knowledge_graph_pipeline(
     session_ids: Optional[List[str]] = None,
     dataset: str = DEFAULT_DATASET_NAME,
     run_in_background: bool = False,
+    config: Optional[dict] = None,
 ):
     """
     Persist user sessions into the knowledge graph via memify pipeline.
@@ -32,6 +33,8 @@ async def persist_sessions_in_knowledge_graph_pipeline(
             are extracted (caller must specify which sessions to persist).
         dataset: Dataset name for write access. Defaults to "main_dataset".
         run_in_background: If True, runs memify asynchronously and returns immediately.
+        config: Optional cognify config (e.g. ``{"ontology_config": {...}}``)
+            applied to the session-QA cognify calls.
     """
     await set_session_user_context_variable(user)
     dataset_to_write = await get_authorized_existing_datasets(
@@ -47,7 +50,7 @@ async def persist_sessions_in_knowledge_graph_pipeline(
     extraction_tasks = [Task(extract_user_sessions, session_ids=session_ids)]
 
     enrichment_tasks = [
-        Task(cognify_session, dataset_id=dataset_to_write[0].id, user=user),
+        Task(cognify_session, dataset_id=dataset_to_write[0].id, user=user, config=config),
     ]
 
     # No set_database_global_context_variables scope around memify: the pipeline

@@ -16,6 +16,7 @@ async def cognify_agent_trace_feedback(
     dataset_id: Optional[UUID | str] = None,
     node_set_name: str = "agent_trace_feedbacks",
     user: Optional[User] = None,
+    config: Optional[dict] = None,
 ) -> None:
     """
     Process and cognify agent trace session text into the knowledge graph.
@@ -28,6 +29,8 @@ async def cognify_agent_trace_feedback(
         node_set_name: Node-set name used when adding the trace text.
         user: User the add/cognify calls run as. Without it they fall back to
             the default user, which has no write ACL on multi-tenant deployments.
+        config: Optional cognify config (e.g. ``{"ontology_config": {...}}``)
+            applied to the trace cognify call.
 
     Raises:
         CogneeValidationError: If data is None or empty.
@@ -54,7 +57,7 @@ async def cognify_agent_trace_feedback(
         # the whole memify run — log the cause and let the remaining sessions
         # proceed (the pre-loud-cognify behavior, now with the error visible).
         cognify_result = await cognee.cognify(
-            datasets=[dataset_id], user=user, raise_on_error=False
+            datasets=[dataset_id], user=user, raise_on_error=False, config=config
         )
         errored_run = get_errored_run_info(cognify_result)
         if errored_run is not None:
