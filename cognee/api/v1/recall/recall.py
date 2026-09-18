@@ -31,6 +31,7 @@ from cognee.modules.recall.types.RecallResponse import (
     RecallResponse,
     ResponseAgentTraceEntry,
     ResponseCodeEntry,
+    ResponseSummaryEntry,
     ResponseGraphEntry,
     ResponseMarkerEntry,
     ResponseQAEntry,
@@ -986,6 +987,77 @@ async def recall(
                         )
                 return entries
 
+            async def _run_summaries() -> list[RecallResponse]:
+                """Semantic recall over the datasets' TextSummary nodes.
+
+                scope=session + query_type=SUMMARIES (the CLI hooks' default
+                injection lane) asked for the pre-generated summaries, but the
+                query_type was never honored: the lane ran the keyword QA
+                match, which only sees the current session's cache and is
+                CJK-blind, so Chinese prompts recalled nothing. Vector-search
+                the targeted datasets' summaries; when they yield nothing
+                (cold dataset, no summaries yet) fall back to the keyword QA
+                match so the lane is never worse than before.
+                """
+                nonlocal user
+
+                from cognee.modules.recall.methods.normalize_search_payload import (
+                    normalize_search_payload,
+                )
+                from cognee.modules.search.methods.search import authorized_search
+
+                if user is None:
+                    try:
+                        user = await get_default_user()
+                    except (DatabaseNotCreatedError, UserNotFoundError) as error:
+                        return []
+
+                search_dataset_ids = dataset_ids or None
+                if search_dataset_ids is None and datasets is not None:
+                    search_dataset_ids = [
+                        dataset.id
+                        for dataset in await get_authorized_existing_datasets(
+                            datasets, "read", user
+                        )
+                    ]
+                    if not search_dataset_ids:
+                        return []
+
+                try:
+                    payloads = await authorized_search(
+                        query_text=query_text,
+                        query_type=SearchType.SUMMARIES,
+                        user=user,
+                        dataset_ids=search_dataset_ids,
+                        top_k=top_k,
+                        only_context=only_context,
+                        context_format=context_format,
+                        session_id=session_id,
+                    )
+                except Exception as error:
+                    # A dataset without a TextSummary_text collection is "no
+                    # summaries yet", not an error — contribute nothing.
+                    logger.warning("Summaries recall failed (non-fatal): %s", error)
+                    return []
+
+                tagged: list[RecallResponse] = []
+                for payload in payloads or []:
+                    items: list[SearchResultItem] = normalize_search_payload(payload)
+                    tagged.extend(
+                        ResponseSummaryEntry(**item.model_dump(), source="summaries")
+                        for item in items
+                    )
+                if not tagged and session_id:
+                    return list(
+                        await _search_session(
+                            query_text=query_text,
+                            session_id=session_id,
+                            top_k=top_k,
+                            user=user,
+                        )
+                    )
+                return tagged
+
             runners = {
                 "session": _run_session,
                 "trace": _run_trace,
@@ -1027,7 +1099,10 @@ async def recall(
                     # go back to the external database.
                     if src == "tools" and tools_trigger == "on_empty" and merged:
                         continue
-                    part = await runner()
+                    if src == "session" and query_type is SearchType.SUMMARIES:
+                        part = await _run_summaries()
+                    else:
+                        part = await runner()
                     if src == "session":
                         session_result_count = len(part)
                     merged.extend(part)

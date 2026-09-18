@@ -24,6 +24,18 @@ class ResponseGraphEntry(SearchResultItem):
     source: Literal["graph"]
 
 
+class ResponseSummaryEntry(SearchResultItem):
+    """One semantic hit from the datasets' pre-generated TextSummary nodes.
+
+    Serves scope=session + query_type=SUMMARIES (the CLI hooks' default
+    injection lane): vector recall over the dataset summaries instead of the
+    session lane's keyword match, which only sees the current session's QA
+    cache and is CJK-blind.
+    """
+
+    source: Literal["summaries"]
+
+
 class ResponseCodeEntry(SearchResultItem):
     """One deterministic code-graph fact from the recall "code" scope.
 
