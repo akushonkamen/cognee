@@ -198,6 +198,59 @@ def test_answer_none_keeps_all_usable_candidates():
 
 
 # ---------------------------------------------------------------------------
+# CJK grounding (Chinese answers were invisible to the ASCII-only tokenizer)
+# ---------------------------------------------------------------------------
+
+
+def test_answer_filtering_understands_chinese_overlap():
+    """A Chinese answer keeps the chunk that shares Chinese terms, drops the rest."""
+    matching = _payload(
+        document_name="workbench.pdf", chunk_index=0, text="供应链决策工作台负责接入数据与授权执行。"
+    )
+    unrelated = _payload(
+        document_name="hr.pdf", chunk_index=1, text="帮我开个离职证明（制度外），期望拒答转人工。"
+    )
+
+    result = format_chunk_references([matching, unrelated], answer="供应链决策工作台是什么")
+
+    assert "workbench.pdf" in result
+    assert "hr.pdf" not in result
+
+
+def test_chinese_answer_with_no_overlap_yields_no_evidence():
+    """A Chinese chunk sharing no CJK bigrams with the answer is not cited."""
+    unrelated = _payload(text="帮我开个离职证明（制度外）。")
+
+    assert format_chunk_references([unrelated], answer="供应链决策工作台是什么") == ""
+
+
+def test_snippet_anchors_on_answer_terms_not_chunk_start():
+    """The snippet window sits at the passage matching the answer, not the head."""
+    filler = "无关内容。" * 80
+    text = "帮我开个离职证明（制度外）。" + filler + "供应链决策工作台负责接入数据、形成方案、授权执行。"
+
+    result = format_chunk_references(
+        [_payload(text=text, chunk_index=0)], answer="供应链决策工作台负责接入数据"
+    )
+
+    assert "供应链决策工作台负责接入数据" in result
+    assert "帮我开个离职证明" not in result
+
+
+def test_identical_content_from_reingested_documents_dedups():
+    """Byte-identical chunks re-ingested under different ids produce one bullet."""
+    same_text = "供应链决策工作台负责接入数据。"
+    payloads = [
+        _payload(document_name=f"text_{i}", chunk_index=1, text=same_text, id=f"chunk-{i}")
+        for i in range(4)
+    ]
+
+    result = format_chunk_references(payloads, answer="供应链决策工作台")
+
+    assert result.count("- chunk 2 of document") == 1
+
+
+# ---------------------------------------------------------------------------
 # build_answer_grounded_chunk_references
 # ---------------------------------------------------------------------------
 

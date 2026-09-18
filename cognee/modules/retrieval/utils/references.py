@@ -19,6 +19,7 @@ unit tested in isolation. All return ``""`` (or the completions unchanged)
 when there is nothing usable, and never raise on backend failures.
 """
 
+import hashlib
 import re
 from typing import Any, List, Optional, Set, Tuple
 
@@ -58,6 +59,12 @@ _STOPWORDS = frozenset(
 )
 
 
+# Terms are ASCII words plus CJK runs (see _term_spans): an ASCII-only
+# tokenizer leaves Chinese text with almost no terms, which let chunks that
+# merely mention stray English words pass the overlap filter.
+_TERM_RE = re.compile(r"[a-z0-9]+|[\u4e00-\u9fff]+")
+
+
 def _clamp_limit(limit: int) -> int:
     """Clamp the requested bullet limit into the contracted 3-5 range."""
     if limit < _MIN_LIMIT:
@@ -83,12 +90,39 @@ def _clean_str(value: Any) -> Optional[str]:
     return stripped or None
 
 
-def _snippet(text: str) -> str:
-    """Collapse whitespace and truncate text into a short snippet."""
+def _snippet(text: str, anchor_terms: Optional[Set[str]] = None) -> str:
+    """Collapse whitespace and truncate text into a short snippet.
+
+    With ``anchor_terms`` the window is placed at the densest cluster of those
+    terms instead of the start of the text: a chunk that opens with an unrelated
+    section (tables, examples) must still show the passage that matches the
+    answer. Leading/trailing ellipses mark elided text on either side.
+    """
     collapsed = " ".join(text.split())
     if len(collapsed) <= _SNIPPET_MAX_CHARS:
         return collapsed
-    return collapsed[: _SNIPPET_MAX_CHARS - 1].rstrip() + "…"
+
+    start = 0
+    if anchor_terms:
+        positions = sorted(
+            offset for term, offset in _term_spans(collapsed.lower()) if term in anchor_terms
+        )
+        if positions:
+            best_score, best_start = 0, 0
+            j = 0
+            for i, p in enumerate(positions):
+                if j < i:
+                    j = i
+                while j < len(positions) and positions[j] < p + _SNIPPET_MAX_CHARS:
+                    j += 1
+                if j - i > best_score:
+                    best_score, best_start = j - i, p
+            start = best_start
+
+    end = start + _SNIPPET_MAX_CHARS - 1
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(collapsed) else ""
+    return prefix + collapsed[start:end].rstrip() + suffix
 
 
 def _chunk_number(payload: dict) -> Optional[int]:
@@ -163,9 +197,33 @@ def _chunk_id(obj: Any, payload: dict) -> Optional[str]:
 
 
 def _significant_terms(text: str) -> Set[str]:
-    """Lowercased alphanumeric terms of an answer, minus stopwords and stubs."""
-    tokens = re.findall(r"[a-z0-9]+", text.lower())
-    return {token for token in tokens if len(token) >= 3 and token not in _STOPWORDS}
+    """Answer terms used for grounding: ASCII words plus CJK bigrams.
+
+    Chinese (and other unspaced CJK) text produces no ``[a-z0-9]+`` tokens, so
+    an ASCII-only tokenizer leaves a Chinese answer with almost no terms and
+    the overlap filter degenerates to matching stray English words. CJK runs
+    are therefore split into overlapping bigrams, which keeps the matching
+    robust to word-boundary differences in unspaced text.
+    """
+    return {term for term, _ in _term_spans(text.lower())}
+
+
+def _term_spans(text: str) -> List[Tuple[str, int]]:
+    """Return ``(term, char_offset)`` for every significant term in ``text``.
+
+    Same tokenizer as :func:`_significant_terms`, but keeps offsets so snippet
+    selection can anchor on the densest term region.
+    """
+    spans: List[Tuple[str, int]] = []
+    for match in _TERM_RE.finditer(text):
+        token = match.group(0)
+        start = match.start()
+        if token.isascii():
+            if len(token) >= 3 and token not in _STOPWORDS:
+                spans.append((token, start))
+        else:
+            spans.extend((token[i : i + 2], start + i) for i in range(len(token) - 1))
+    return spans
 
 
 def format_chunk_references(
@@ -220,6 +278,7 @@ def format_chunk_references(
     # (overlap_score, document_name, number, text, data_id, chunk_id) per candidate.
     candidates: List[Tuple[int, str, int, str, Optional[str], Optional[str]]] = []
     seen: set = set()
+    seen_text: set = set()
 
     for obj in iterator:
         payload = _get_payload(obj)
@@ -246,9 +305,17 @@ def format_chunk_references(
             continue
         seen.add(dedup_key)
 
+        # Re-ingesting the same content (repeated session syncs, re-uploads)
+        # produces distinct chunk ids for byte-identical text; without this
+        # check the block fills with near-identical bullets.
+        content_key = hashlib.sha256(" ".join(text.split()).lower().encode("utf-8")).hexdigest()
+        if content_key in seen_text:
+            continue
+        seen_text.add(content_key)
+
         score = 0
         if answer_terms is not None:
-            chunk_terms = set(re.findall(r"[a-z0-9]+", text.lower()))
+            chunk_terms = {term for term, _ in _term_spans(text.lower())}
             score = len(answer_terms & chunk_terms)
             if score == 0:
                 # No term from the answer appears in this chunk: it is almost
@@ -267,7 +334,7 @@ def format_chunk_references(
     max_bullets = _clamp_limit(limit)
     bullets = [
         f"- chunk {number} of document {document_name}"
-        f'{_provenance_suffix(data_id, chunk_id)}: "{_snippet(text)}"'
+        f'{_provenance_suffix(data_id, chunk_id)}: "{_snippet(text, answer_terms)}"'
         for _, document_name, number, text, data_id, chunk_id in candidates[:max_bullets]
     ]
 
