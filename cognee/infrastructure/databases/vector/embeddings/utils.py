@@ -1,5 +1,16 @@
+import re
 from typing import List, Union
 from cognee.shared.logging_utils import setup_logging
+
+# Inline data URIs (e.g. a conversation that quotes a
+# "data:image/png;base64,..." payload) are rejected by some embedding
+# endpoints — NVIDIA NIM scans input text for them and answers 400
+# "image inputs require VLM serving" even though the input is a plain
+# string. The base64 payload carries no semantic value for the embedding
+# anyway, so the sanitizer neutralizes the whole URI.
+_DATA_URI_RE = re.compile(
+    r"data:[a-z0-9.+-]+/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+", re.IGNORECASE
+)
 
 logger = setup_logging()
 
@@ -31,7 +42,8 @@ def sanitize_embedding_text_inputs(text: Union[str, List[str]]) -> List[str]:
     text_list = [text] if isinstance(text, str) else text
     dummy_value = "."
 
-    return [t if is_embeddable(t) else dummy_value for t in text_list]
+    cleaned = [_DATA_URI_RE.sub("[embedded data uri]", t) if isinstance(t, str) else t for t in text_list]
+    return [t if is_embeddable(t) else dummy_value for t in cleaned]
 
 
 def handle_embedding_response(
