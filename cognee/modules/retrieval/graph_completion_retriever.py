@@ -327,9 +327,14 @@ class GraphCompletionRetriever(BaseRetriever):
         query: Optional[str],
         query_batch: Optional[List[str]],
         context: str,
+        system_prompt: Optional[str] = None,
     ) -> List[Any]:
         """Generate completion(s) without session; returns list of completions."""
         kwargs = self._completion_kwargs(context)
+        # Callers like the BEAM eval router pass a per-question system prompt
+        # (e.g. the abstention rubric prompt); it overrides the default.
+        if system_prompt:
+            kwargs["system_prompt"] = system_prompt
         # Sessionless guidance site: preference text rides the guidance channel
         # (conversation_history), never context. The lookup is memoized per
         # context; this sessionless path runs retrieval and completion in one
@@ -371,6 +376,7 @@ class GraphCompletionRetriever(BaseRetriever):
         context: str = None,
         effective_query: Optional[str] = None,
         turn_preparation=None,
+        system_prompt: Optional[str] = None,
     ) -> List[Any]:
         """
         Generates an LLM response based on the query, context, and conversation history.
@@ -411,7 +417,7 @@ class GraphCompletionRetriever(BaseRetriever):
             completions = [completion]
         else:
             completions = await self._generate_completion_without_session(
-                query, query_batch, context
+                query, query_batch, context, system_prompt=system_prompt
             )
 
         # Session and non-session branches rejoin here so every variant that calls
