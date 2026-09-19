@@ -9,7 +9,11 @@ from cognee.shared.logging_utils import setup_logging
 # string. The base64 payload carries no semantic value for the embedding
 # anyway, so the sanitizer neutralizes the whole URI.
 _DATA_URI_RE = re.compile(
-    r"data:[a-z0-9.+-]+/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+", re.IGNORECASE
+    # Match the URI up to the next delimiter even when the payload is a
+    # template placeholder ("data:image/png;base64,{img_base64}") rather
+    # than real base64 — the endpoint flags on the prefix alone.
+    r"data:[a-z0-9.+-]+/[a-z0-9.+-]+;base64,[^\s`'\"<>)]*",
+    re.IGNORECASE,
 )
 
 logger = setup_logging()

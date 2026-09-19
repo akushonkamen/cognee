@@ -21,6 +21,15 @@ def test_data_uri_in_text_is_neutralized():
     assert is_embeddable(out)
 
 
+def test_template_placeholder_data_uri_is_neutralized():
+    """NIM flags on the URI prefix alone — even a code template like
+    'data:image/png;base64,{img_base64}' must be neutralized."""
+    text = 'return jsonify({"image": f"data:image/png;base64,{img_base64}"}), 200'
+    (out,) = sanitize_embedding_text_inputs([text])
+
+    assert "data:image" not in out
+
+
 def test_plain_text_survives_sanitization():
     text = "a plain sentence mentioning base64 image encoding, no URI"
     assert sanitize_embedding_text_inputs([text]) == [text]
