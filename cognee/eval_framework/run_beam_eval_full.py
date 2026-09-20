@@ -21,7 +21,9 @@ logger = get_logger()
 eval_params = EvalConfig(
     benchmark="BEAM",
     building_corpus_from_scratch=True,
-    number_of_samples_in_corpus=1,
+    # BEAM load_corpus uses this as the probing-question limit:
+    # None = answer every question of the conversation.
+    number_of_samples_in_corpus=None,
     qa_engine="beam_router",
     answering_questions=True,
     evaluating_answers=True,
