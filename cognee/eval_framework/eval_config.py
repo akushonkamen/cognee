@@ -6,7 +6,7 @@ from typing import List, Optional
 class EvalConfig(BaseSettings):
     # Corpus builder params
     building_corpus_from_scratch: bool = True
-    number_of_samples_in_corpus: Optional[int] = 1
+    number_of_samples_in_corpus: int = 1
     benchmark: str = "Dummy"  # Options: 'HotPotQA', 'Dummy', 'TwoWikiMultiHop', 'BEAM'
     task_getter_type: str = (
         "Default"  # Options: 'Default', 'CascadeGraph', 'NoSummaries', 'JustChunks'
