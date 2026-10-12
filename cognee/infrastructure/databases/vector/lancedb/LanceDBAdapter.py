@@ -2,6 +2,7 @@ import asyncio
 import copy
 import inspect
 import threading
+import time
 import types
 from collections import OrderedDict
 from enum import Enum
@@ -979,12 +980,29 @@ class LanceDBAdapter(VectorDBInterface):
             logger.warning("Version prune on open skipped: %s", exc, exc_info=True)
             return {"error": str(exc)[:200]}
 
+    # How long ``close()`` (and ``compact()``/``prune()``) waits on a version
+    # prune that was started on a *different* event loop before tearing the
+    # store down anyway. The prune is bounded like a pass, so this only ever
+    # lapses when the owning loop died or the prune is wedged; a late prune
+    # RPC past this point is rejected by the closed session without a
+    # respawn (issue #5710).
+    _CROSS_LOOP_PRUNE_WAIT_SECONDS = 10.0
+
     async def _wait_for_open_prune(self) -> None:
         """Let a running version prune (first-open or follow-up, see
         ``_start_prune_task``) finish -- it is bounded -- before this adapter
         compacts, prunes or closes, so they never overlap and closing never tears
-        the worker down under it. A prune started on another event loop cannot be
-        awaited from this one and is left alone."""
+        the worker down under it.
+
+        A prune that belongs to this event loop is awaited directly. A prune on
+        another loop (``close()`` via ``closing_lru_cache`` runs on a fresh
+        ``asyncio.run`` loop) cannot be awaited from here; poll its done flag
+        instead, bounded, and only while the owning loop is around to finish
+        it. If the bounded wait gives up -- the owning loop is gone, or the
+        prune is wedged past the budget -- the late prune RPC is rejected by
+        the already-closed session, where an intentional shutdown is terminal:
+        the prune fails without respawning a worker (issue #5710).
+        """
         task = self._open_prune_task
         if task is None or task.done():
             return
@@ -994,6 +1012,17 @@ class LanceDBAdapter(VectorDBInterface):
             return
         if same_loop:
             await asyncio.wait({task})
+            return
+        owner_loop = task.get_loop()
+        if not owner_loop.is_running():
+            # The owning loop is between runs or already closed (a finished
+            # ``asyncio.run`` closes its loop): the task cannot progress
+            # right now, and a closed loop can never finish it at all.
+            # Waiting here would only burn the budget on every close.
+            return
+        deadline = time.monotonic() + self._CROSS_LOOP_PRUNE_WAIT_SECONDS
+        while not task.done() and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
 
     async def _prune_pass(self, options: dict) -> dict:
         """Prune superseded versions across the store's tables; no fragment rewrites."""

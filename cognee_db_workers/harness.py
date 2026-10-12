@@ -733,6 +733,16 @@ class SubprocessSession:
         # bool) lets the reader poll it cheaply at the top of its loop and
         # avoids a separate mutex for the closed-state read/write.
         self._closed_event = threading.Event()
+        # Set only by ``shutdown()`` — the *intentional* close path. This
+        # distinguishes "the owner closed this session on purpose" from the
+        # other writers of ``_closed_event``: the reader thread sets it when
+        # a worker dies (respawn recovers), and the consecutive-timeout path
+        # sets it precisely to *trigger* a respawn. A session that was shut
+        # down intentionally must never respawn: a late RPC racing the close
+        # (e.g. a cross-loop background prune arriving after the adapter's
+        # ``close()``, issue #5710) must get a terminal transport error
+        # instead of a replacement worker that outlives the close.
+        self._intentionally_shutdown = threading.Event()
         # Per-call retry state. The session-level deadline (per-call
         # timeout) does NOT mark the session closed — sibling calls may
         # still succeed — but consecutive timeouts on the same caller
@@ -1211,7 +1221,10 @@ class SubprocessSession:
                 await loop.run_in_executor(None, self._respawn)
 
     def _can_respawn(self) -> bool:
-        return self._respawn_factory is not None
+        # An intentional ``shutdown()`` is terminal: the retry loops must
+        # surface the transport error instead of starting a replacement
+        # worker for a session the owner closed on purpose (issue #5710).
+        return self._respawn_factory is not None and not self._intentionally_shutdown.is_set()
 
     def _apply_remap(self, req: Request) -> Request:
         """After a successful respawn, previously-allocated handle ids are
@@ -1289,6 +1302,16 @@ class SubprocessSession:
             )
 
         with self._respawn_lock:
+            # An intentional ``shutdown()`` is terminal — checked under the
+            # lock so a shutdown that races us always wins: its flag is set
+            # before it tears anything down, so any respawn entering the
+            # lock afterwards refuses instead of starting a worker the
+            # owner will never shut down (issue #5710).
+            if self._intentionally_shutdown.is_set():
+                raise SubprocessTransportError(
+                    "Subprocess session was intentionally shut down; refusing to respawn"
+                )
+
             # Another concurrent retry may have already respawned successfully
             # between the moment the current caller's RPC failed and us
             # acquiring the lock. If the process is alive again, bail out —
@@ -1447,6 +1470,14 @@ class SubprocessSession:
         and force-terminate.
         """
         t = timeout if timeout is not None else self._shutdown_timeout
+
+        # Mark the intentional close BEFORE flipping ``_closed_event``, so a
+        # retry loop whose in-flight RPC fails on the closing session reads
+        # ``_can_respawn() == False`` and re-raises instead of starting a
+        # replacement worker for a session the owner closed on purpose
+        # (issue #5710: a cross-loop version-prune RPC racing an adapter
+        # close used to respawn a worker that outlived the close).
+        self._intentionally_shutdown.set()
 
         already_closed = self._closed_event.is_set()
         # Set closed under the registry lock so any caller about to add a

@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import sys
+import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
@@ -969,6 +971,101 @@ async def test_compact_and_close_wait_for_a_running_open_prune(
     await second.close()
     assert finished == [True, True]
     await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_close_on_a_foreign_loop_waits_for_a_running_open_prune(
+    tmp_path, compaction_settings, monkeypatch
+):
+    """Issue #5710, adapter half: the eviction path runs ``close()`` under a
+    fresh ``asyncio.run`` loop, so a still-running first-open prune belongs
+    to another loop and cannot be awaited from there. Close must still wait
+    for it (bounded poll) instead of tearing the store down under it — the
+    old code returned at once and let the prune race the teardown.
+    """
+    compaction_settings(retention_seconds=0)
+    adapter, _ = _adapter(tmp_path)
+    started, finished = asyncio.Event(), []
+
+    async def slow_prune_pass(options):
+        started.set()
+        await asyncio.sleep(0.3)
+        finished.append(True)
+        return {}
+
+    monkeypatch.setattr(adapter, "_prune_pass", slow_prune_pass)
+    await adapter.get_connection()
+    await started.wait()
+
+    # Close on a foreign loop, like ``closing_lru_cache``'s eviction does.
+    await asyncio.to_thread(lambda: asyncio.run(adapter.close()))
+
+    assert finished == [True], "close on a foreign loop must wait for the open prune"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="explicit worker spawn deadlocks intermittently on Windows (SDK-540)",
+)
+async def test_close_on_a_foreign_loop_leaves_no_worker_alive_after_a_late_prune(
+    tmp_path, compaction_settings, monkeypatch
+):
+    """Issue #5710 end to end: the first-open prune is still running when the
+    adapter is closed on a fresh loop. The close gives up on the cross-loop
+    prune after a short budget and tears the worker down; the prune's late
+    RPC (op 128, ``OP_TABLE_PRUNE_VERSIONS``, in the report) then hits the
+    closed session and must fail terminally — no replacement worker may
+    outlive ``close()``.
+    """
+    from cognee.infrastructure.databases.vector.lancedb.subprocess.proxy import (
+        LanceDBSubprocessSession,
+        RemoteLanceDBConnection,
+    )
+    from cognee_db_workers.harness import Request
+    from cognee_db_workers.lancedb_protocol import OP_TABLE_NAMES
+
+    compaction_settings(retention_seconds=0)
+    session = LanceDBSubprocessSession.start()
+    try:
+        adapter = LanceDBAdapter(
+            url=None,
+            api_key=None,
+            embedding_engine=_FakeEmbeddingEngine(),
+            connection=RemoteLanceDBConnection(session, url=str(tmp_path / "db"), api_key=None),
+            session=session,
+        )
+        started, released = asyncio.Event(), threading.Event()
+
+        async def gated_prune_pass(options):
+            started.set()
+            # Park off-loop so the close on the foreign loop proceeds.
+            await asyncio.get_running_loop().run_in_executor(None, released.wait)
+            # The late RPC — any session RPC shows the respawn hole; the
+            # report's was the prune's op 128.
+            await session.call_async(Request(op=OP_TABLE_NAMES))
+            return {}
+
+        monkeypatch.setattr(adapter, "_prune_pass", gated_prune_pass)
+        # Keep the foreign-loop wait short: what's under test is the
+        # lifecycle after close gives up on the cross-loop prune.
+        monkeypatch.setattr(adapter, "_CROSS_LOOP_PRUNE_WAIT_SECONDS", 0.2)
+
+        adapter._schedule_open_prune()
+        await started.wait()
+
+        old_pid = session.pid
+        await asyncio.to_thread(lambda: asyncio.run(adapter.close()))
+        assert not session._proc.is_alive(), "close must tear the worker down"
+
+        # The prune resumes on the original loop and issues its late RPC.
+        released.set()
+        await asyncio.wait({adapter._open_prune_task}, timeout=30)
+
+        assert session.pid == old_pid, "late prune RPC must not respawn a worker"
+        assert not session._proc.is_alive(), "no worker may outlive close()"
+    finally:
+        session.shutdown()
 
 
 @pytest.mark.asyncio

@@ -11,6 +11,7 @@ Covers the scenarios that used to silently hang or leak:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import multiprocessing as mp
 import sys
@@ -598,6 +599,80 @@ def test_retry_does_not_fire_on_application_error():
         assert session.pid == original_pid, "should NOT have respawned"
         # Session still usable after an application error.
         assert session.call(Request(op=OP_ECHO, args=("still-ok",))).result == "still-ok"
+    finally:
+        session.shutdown()
+
+
+# --- intentional shutdown is terminal (issue #5710) -----------------------
+
+
+def test_call_after_intentional_shutdown_does_not_respawn():
+    """Regression for #5710: after an explicit ``shutdown()`` the retry loop
+    must surface the transport error instead of starting a replacement
+    worker. Before the fix, the closed session's ``SubprocessTransportError``
+    routed into ``_respawn``, whose only bail-out ("not closed and alive")
+    does not cover an intentionally shut-down session — closed flag set,
+    worker dead — so a fresh worker was spawned and outlived the shutdown.
+    """
+    session = _start_retryable_session(max_retries=2)
+    try:
+        original_pid = session.pid
+        session.shutdown()
+
+        with pytest.raises(SubprocessTransportError, match="session is closed"):
+            session.call(Request(op=OP_ECHO, args=("late",)))
+
+        assert session.pid == original_pid, "intentional shutdown must not respawn a worker"
+        assert not session._proc.is_alive()
+    finally:
+        session.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_call_async_from_other_loop_after_shutdown_is_terminal():
+    """The #5710 sequence in miniature: the intentional shutdown runs on a
+    second event loop inside a pool thread (the ``ClosingLRUCache`` eviction
+    path runs ``close()`` under a fresh ``asyncio.run``, and the adapter's
+    close offloads ``session.shutdown()`` via ``asyncio.to_thread``), then a
+    late RPC — the first-open version prune's op 128 in the real report —
+    arrives from the original loop. It must fail terminally without
+    respawning a worker.
+    """
+    session = _start_retryable_session(max_retries=2)
+    try:
+        original_pid = session.pid
+
+        def _close_like_eviction():
+            # A fresh event loop on a pool thread, exactly like the eviction
+            # path that triggered the reported leak.
+            asyncio.run(asyncio.to_thread(session.shutdown))
+
+        await asyncio.to_thread(_close_like_eviction)
+
+        with pytest.raises(SubprocessTransportError, match="session is closed"):
+            await session.call_async(Request(op=OP_ECHO, args=("late-prune",)))
+
+        assert session.pid == original_pid, "late cross-loop RPC must not respawn a worker"
+        assert not session._proc.is_alive()
+    finally:
+        session.shutdown()
+
+
+def test_respawn_refuses_after_intentional_shutdown():
+    """``_respawn`` itself must refuse to start a worker for a session the
+    owner shut down on purpose — checked under ``_respawn_lock`` so a
+    shutdown racing a concurrent retry always wins.
+    """
+    session = _start_retryable_session()
+    try:
+        original_pid = session.pid
+        session.shutdown()
+
+        with pytest.raises(SubprocessTransportError, match="intentionally shut down"):
+            session._respawn()
+
+        assert session.pid == original_pid, "must not have spawned a replacement worker"
+        assert not session._proc.is_alive()
     finally:
         session.shutdown()
 
