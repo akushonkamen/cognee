@@ -1,5 +1,3 @@
-import os
-from functools import lru_cache
 from typing import Literal
 
 from pydantic import Field
@@ -65,9 +63,32 @@ class CognifyConfig(BaseSettings):
         }
 
 
-@lru_cache
-def get_cognify_config():
-    return CognifyConfig()
+# Values set programmatically through ``cognee.config`` (e.g.
+# ``set_classification_model``). They live outside the environment so that
+# ``get_cognify_config`` can re-read environment variables on every call
+# (issue #5771) while setter changes still apply process-wide, overriding env.
+_config_overrides: dict = {}
+
+
+def get_cognify_config() -> CognifyConfig:
+    """Build the cognify config from the current environment.
+
+    Environment variables (GRAPH_EXTRACTOR, SUMMARY_METHOD, PROVENANCE_TRACKING,
+    ...) are read on every call, so changing them at runtime takes effect for
+    the next call. Values set via ``override_cognify_config`` (the
+    ``cognee.config`` setters) take precedence over the environment.
+    """
+    return CognifyConfig(**_config_overrides)
+
+
+def override_cognify_config(**values) -> None:
+    """Apply process-wide config overrides on top of the environment.
+
+    Used by the ``cognee.config`` setters, whose values are Python objects that
+    cannot be expressed as environment variables (e.g. the classification and
+    summarization model classes).
+    """
+    _config_overrides.update(values)
 
 
 def resolve_summary_method(value: str | None, config: CognifyConfig) -> str:
