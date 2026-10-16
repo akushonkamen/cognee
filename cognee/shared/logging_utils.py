@@ -14,18 +14,44 @@ from typing import Any
 import structlog
 
 
+def _local_pyproject_version(pyproject_path: Path) -> str | None:
+    """Return the version from a nearby pyproject.toml — but only cognee's own.
+
+    Same rule as ``cognee.version``: the cognee-mcp image (docker-compose.yml)
+    mounts the cognee package at /app/cognee right next to the image's own
+    /app/pyproject.toml, and taking that file's version line at face value
+    reported cognee-mcp's version as cognee's (issue #5807). A nearby
+    pyproject.toml therefore only counts when its project name is exactly
+    "cognee". Kept local to this module: importing cognee.version would trigger
+    ``cognee/__init__.py``, which this bootstrap deliberately avoids.
+    """
+    try:
+        pyproject = pyproject_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    name = None
+    version = None
+    for line in pyproject.splitlines():
+        stripped = line.strip()
+        if name is None and stripped.startswith("name") and "=" in stripped:
+            name = stripped.split("=", 1)[1].strip("'\"\n ")
+        elif version is None and stripped.startswith("version") and "=" in stripped:
+            version = stripped.split("=", 1)[1].strip("'\"\n ")
+        if name is not None and version is not None:
+            break
+    if name == "cognee" and version:
+        return version
+    return None
+
+
 def _get_cognee_version() -> str:
     """Get version without importing cognee (avoids triggering __init__.py)."""
     import importlib.metadata as _meta
-    from contextlib import suppress
 
-    with suppress(FileNotFoundError, StopIteration):
-        _pyproject = Path(__file__).parent.parent.parent / "pyproject.toml"
-        with open(_pyproject, encoding="utf-8") as f:
-            _ver = (
-                next(line for line in f if line.startswith("version")).split("=")[1].strip("'\"\n ")
-            )
-            return f"{_ver}-local"
+    version = _local_pyproject_version(Path(__file__).parent.parent.parent / "pyproject.toml")
+    if version is not None:
+        return f"{version}-local"
     try:
         return _meta.version("cognee")
     except _meta.PackageNotFoundError:
