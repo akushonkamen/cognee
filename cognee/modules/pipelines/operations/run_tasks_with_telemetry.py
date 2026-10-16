@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 from contextlib import aclosing
@@ -25,6 +26,7 @@ PIPELINE_RUN_ERRORED = "Pipeline Run Errored"
 PIPELINE_ITEM_STARTED = "Pipeline Item Started"
 PIPELINE_ITEM_COMPLETED = "Pipeline Item Completed"
 PIPELINE_ITEM_ERRORED = "Pipeline Item Errored"
+PIPELINE_ITEM_CANCELLED = "Pipeline Item Cancelled"
 
 # The data item's profile leaves as closed labels: a loader registry name, a
 # short extension, and size/token classes. Upper bound of each class (bytes,
@@ -197,15 +199,24 @@ async def run_tasks_with_telemetry(
         # send_telemetry only schedules delivery on the running loop. When the
         # cancellation comes from a process shutdown, the loop may close before
         # the request goes out, so this event is best effort in that case.
+        # A CancelledError is an outcome of its own, not a failure: when one
+        # data item fails, run_tasks cancels every still-running sibling, and
+        # those siblings used to surface here as Pipeline Item Errored with
+        # exception_type=CancelledError — 85.6% of 1.6.3's task errors were
+        # exactly that, drowning the real failure causes in the warehouse.
+        # GeneratorExit (a consumer that stopped iterating) is not a peer
+        # cancellation and keeps the Errored outcome.
+        cancelled = isinstance(error, asyncio.CancelledError)
         if isinstance(error, Exception):
             logger.exception("Pipeline item errored: `%s`\n", pipeline_name)
         else:
             logger.info("Pipeline item cancelled: `%s` (%s)", pipeline_name, type(error).__name__)
         with telemetry_guard():
             send_telemetry(
-                PIPELINE_ITEM_ERRORED,
+                PIPELINE_ITEM_CANCELLED if cancelled else PIPELINE_ITEM_ERRORED,
                 user,
-                additional_properties=properties | telemetry_exception_properties(error),
+                additional_properties=properties
+                | ({} if cancelled else telemetry_exception_properties(error)),
             )
 
         raise

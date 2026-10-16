@@ -1,3 +1,5 @@
+import asyncio
+
 from cognee import __version__ as cognee_version
 from cognee.infrastructure.engine import DataPoint
 from cognee.modules.observability import (
@@ -250,6 +252,10 @@ async def handle_task(
             span.set_status(StatusCode.ERROR, str(error))
             span.record_exception(error)
 
+            # A CancelledError is an outcome of its own, not a failure: a sibling's
+            # failure cancels every still-running item, and those items used to be
+            # counted as task errors in the warehouse (telemetry insight #5807).
+            cancelled = isinstance(error, asyncio.CancelledError)
             if isinstance(error, Exception):
                 logger.exception(
                     f"{task_type} task errored: `{task_name}`\n",
@@ -263,10 +269,10 @@ async def handle_task(
             if not downstream_failed:
                 with telemetry_guard():
                     send_telemetry(
-                        f"{task_type} Task Errored",
+                        f"{task_type} Task {'Cancelled' if cancelled else 'Errored'}",
                         user,
                         additional_properties=task_properties
-                        | telemetry_exception_properties(error),
+                        | ({} if cancelled else telemetry_exception_properties(error)),
                     )
             raise
 

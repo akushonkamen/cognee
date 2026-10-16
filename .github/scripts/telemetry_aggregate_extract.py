@@ -107,6 +107,7 @@ EVENT_ALLOWLIST = (
     "Pipeline Item Started",
     "Pipeline Item Completed",
     "Pipeline Item Errored",
+    "Pipeline Item Cancelled",
 )
 
 # The pseudonymous deployment identity, in decreasing stability order:

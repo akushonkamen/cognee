@@ -1,8 +1,9 @@
 """Pipeline and task telemetry events (SDK-775).
 
 Every event of a run carries ``pipeline_run_id``; error events carry the
-exception class and never its message; cancellation and a closed generator
-still emit a terminal event instead of leaving a silent ``Started``.
+exception class and never its message; every interruption still emits a
+terminal event instead of leaving a silent ``Started`` — cancellation as its
+own ``* Cancelled`` outcome, a closed generator as ``Pipeline Item Errored``.
 """
 
 import asyncio
@@ -116,19 +117,31 @@ async def test_root_cause_is_reported_through_a_wrapping_error(events):
 
 
 @pytest.mark.asyncio
-async def test_cancelled_run_emits_a_terminal_event(events):
+async def test_cancelled_run_emits_a_cancelled_event_not_an_errored_one(events):
+    """Cancellation is an outcome of its own: a cancelled item and its task emit
+    ``* Cancelled`` terminal events, so a run cancelled by its peers' failure is
+    never counted as a task error in the warehouse."""
+
+    run_id = uuid4()
+
     async def cancelled(data):
         raise asyncio.CancelledError()
 
     with pytest.raises(asyncio.CancelledError):
-        await _drain([Task(cancelled)], PipelineContext(pipeline_run_id=uuid4()))
+        await _drain([Task(cancelled)], PipelineContext(pipeline_run_id=run_id))
 
     names = [name for name, _ in _pipeline_events(events)]
-    assert names == ["Pipeline Item Started", "Pipeline Item Errored"]
-    (errored,) = [p for n, p in _pipeline_events(events) if n == "Pipeline Item Errored"]
-    assert errored["exception_type"] == "CancelledError"
-    ((_, task_errored),) = _task_events(events, "Errored")
-    assert task_errored["exception_type"] == "CancelledError"
+    assert names == ["Pipeline Item Started", "Pipeline Item Cancelled"]
+    (pipeline_cancelled,) = [
+        p for n, p in _pipeline_events(events) if n == "Pipeline Item Cancelled"
+    ]
+    assert pipeline_cancelled["pipeline_run_id"] == str(run_id)
+    assert "exception_type" not in pipeline_cancelled
+    ((_, task_cancelled),) = _task_events(events, "Cancelled")
+    assert task_cancelled["task_name"] == "cancelled"
+    assert "exception_type" not in task_cancelled
+    assert not _task_events(events, "Errored")
+    assert not [n for n, _ in _pipeline_events(events) if "Errored" in n]
 
 
 @pytest.mark.asyncio
