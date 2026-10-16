@@ -9,10 +9,12 @@ import os
 from collections.abc import AsyncGenerator
 from contextlib import aclosing
 from typing import Any
+from urllib.parse import urlparse
 
 from sqlalchemy import select
 
 from cognee.infrastructure.databases.relational import get_relational_engine
+from cognee.infrastructure.files.utils.get_data_file_path import get_data_file_path
 from cognee.infrastructure.files.utils.open_data_file import open_data_file
 from cognee.modules import ingestion
 from cognee.modules.data.models import Data, Dataset
@@ -20,12 +22,14 @@ from cognee.modules.pipelines.models import PipelineContext
 from cognee.modules.pipelines.models.DataItemStatus import (
     DataItemStatus,
     is_data_item_completed,
+    is_data_item_errored,
 )
 from cognee.modules.pipelines.models.PipelineRunInfo import (
     PipelineRunAlreadyCompleted,
     PipelineRunCompleted,
     PipelineRunErrored,
     PipelineRunProgress,
+    PipelineRunSkipped,
     PipelineRunYield,
 )
 from cognee.modules.pipelines.operations.run_tasks_with_telemetry import run_tasks_with_telemetry
@@ -41,6 +45,69 @@ from cognee.tasks.ingestion.save_data_item_to_storage import (
 from ..tasks.task import Task
 
 logger = get_logger("run_tasks_data_item")
+
+
+def _source_file_missing(error: Exception, data_point: Any) -> bool:
+    """Whether ``error`` means this item's own source file is gone.
+
+    Only a FileNotFoundError raised while the data row's local raw_data_location
+    no longer exists counts: no retry can read a deleted file, so the item is
+    terminal (marked errored and skipped by later runs). A FileNotFoundError for
+    any other path (a prompt template, a config file) or on a row we cannot
+    check stays retryable and keeps the plain error behavior. Remote schemes
+    (s3://) would need network I/O to check existence, so they keep the retry
+    behavior too.
+    """
+    if not isinstance(error, FileNotFoundError):
+        return False
+    location = getattr(data_point, "raw_data_location", None)
+    if not isinstance(location, str) or not location:
+        return False
+    resolved = get_data_file_path(location)
+    if urlparse(resolved).scheme:
+        return False
+    return not os.path.exists(resolved)
+
+
+async def _record_item_pipeline_status(
+    db_engine,
+    *,
+    data_id,
+    content_hash,
+    user,
+    dataset,
+    pipeline_name,
+    status_value,
+) -> Any:
+    """Resolve the item's Data row fresh inside the write session and record
+    ``status_value`` in its ``pipeline_status[pipeline_name][str(dataset.id)]``
+    slot. Returns the resolved row, or None when the item has no row yet (and
+    no hash to find one by).
+    """
+    async with db_engine.get_async_session() as session:
+        if data_id is not None:
+            data_point = (
+                await session.execute(select(Data).filter(Data.id == data_id))
+            ).scalar_one_or_none()
+        elif content_hash is not None:
+            data_point = await ingestion.identify_data_by_hash(
+                content_hash, user, dataset.id, session=session
+            )
+        else:
+            data_point = None
+        if data_point is not None:
+            status_for_pipeline = data_point.pipeline_status
+            if status_for_pipeline is None:
+                # Assign, then read back: MutableDict.as_mutable coerces (copies)
+                # an assigned plain dict, so mutating the pre-assignment object
+                # would silently lose the status.
+                data_point.pipeline_status = {}
+                status_for_pipeline = data_point.pipeline_status
+            status_for_pipeline.setdefault(pipeline_name, {})
+            status_for_pipeline[pipeline_name][str(dataset.id)] = status_value
+            await session.merge(data_point)
+            await session.commit()
+        return data_point
 
 
 def _push_stage_progress(
@@ -213,6 +280,20 @@ async def run_tasks_data_item_incremental(
                 "data_id": data_id,
             }
             return
+        # A terminal per-item failure (today: the item's source file is gone) can
+        # never succeed on a retry — re-running it would only repeat the failure
+        # and, with RAISE_INCREMENTAL_LOADING_ERRORS at its default, fail the
+        # whole build again. Skip it and say so.
+        if is_data_item_errored(status_for_pipeline.get(str(dataset.id))):
+            yield {
+                "run_info": PipelineRunSkipped(
+                    pipeline_run_id=pipeline_run_id,
+                    dataset_id=dataset.id,
+                    dataset_name=dataset.name,
+                ),
+                "data_id": data_id,
+            }
+            return
 
     try:
         # Process data based on data_item and list of tasks. aclosing closes
@@ -237,23 +318,17 @@ async def run_tasks_data_item_incremental(
         # Update pipeline status for Data element. Fresh content had no row at
         # the pre-check (data_id None); ingestion has created it since — resolve
         # the row it was given, in the same session that records the status.
-        async with db_engine.get_async_session() as session:
-            if data_id is not None:
-                data_point = (
-                    await session.execute(select(Data).filter(Data.id == data_id))
-                ).scalar_one_or_none()
-            elif content_hash is not None:
-                data_point = await ingestion.identify_data_by_hash(
-                    content_hash, user, dataset.id, session=session
-                )
-                data_id = data_point.id if data_point is not None else None
-            else:
-                data_point = None
-            if data_point is not None:
-                status_for_pipeline = data_point.pipeline_status.setdefault(pipeline_name, {})
-                status_for_pipeline[str(dataset.id)] = DataItemStatus.DATA_ITEM_PROCESSING_COMPLETED
-                await session.merge(data_point)
-                await session.commit()
+        resolved_data_point = await _record_item_pipeline_status(
+            db_engine,
+            data_id=data_id,
+            content_hash=content_hash,
+            user=user,
+            dataset=dataset,
+            pipeline_name=pipeline_name,
+            status_value=DataItemStatus.DATA_ITEM_PROCESSING_COMPLETED,
+        )
+        if data_id is None:
+            data_id = resolved_data_point.id if resolved_data_point is not None else None
 
         yield {
             "run_info": PipelineRunCompleted(
@@ -270,6 +345,42 @@ async def run_tasks_data_item_incremental(
             f"Exception caught while processing data: {error}.\n Data processing failed for data item: {data_item}."
         )
         from cognee.modules.operations import scrub_error_message
+
+        # A gone source file is permanent: no retry can read it, so re-raising (or
+        # leaving the item statusless, the pre-fix behavior) made every later run
+        # re-read the same missing file and fail the whole build again. Record the
+        # terminal errored status so later runs skip the item, and let this run
+        # keep going with a skip event instead of a hard failure.
+        if _source_file_missing(error, data_point):
+            try:
+                resolved_data_point = await _record_item_pipeline_status(
+                    db_engine,
+                    data_id=data_id,
+                    content_hash=content_hash,
+                    user=user,
+                    dataset=dataset,
+                    pipeline_name=pipeline_name,
+                    status_value=DataItemStatus.DATA_ITEM_PROCESSING_ERRORED,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to record the terminal errored status of a data item whose source file is missing"
+                )
+                resolved_data_point = None
+            if data_id is None:
+                data_id = resolved_data_point.id if resolved_data_point is not None else None
+
+            yield {
+                "run_info": PipelineRunSkipped(
+                    pipeline_run_id=pipeline_run_id,
+                    dataset_id=dataset.id,
+                    dataset_name=dataset.name,
+                    error_class=type(error).__name__,
+                    error_message=scrub_error_message(error),
+                ),
+                "data_id": data_id,
+            }
+            return
 
         yield {
             "run_info": PipelineRunErrored(

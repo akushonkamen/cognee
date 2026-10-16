@@ -39,6 +39,16 @@ class PipelineRunAlreadyCompleted(PipelineRunInfo):
     status: str = "PipelineRunAlreadyCompleted"
 
 
+class PipelineRunSkipped(PipelineRunInfo):
+    status: str = "PipelineRunSkipped"
+
+    # Why the item was skipped (today: its source file is gone, so no retry can
+    # ever process it — the item is marked errored and skipped by later runs).
+    # error_message is PII-scrubbed, mirroring PipelineRunErrored.
+    error_class: str | None = None
+    error_message: str | None = None
+
+
 class PipelineRunErrored(PipelineRunInfo):
     status: str = "PipelineRunErrored"
 
